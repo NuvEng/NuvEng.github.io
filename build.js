@@ -20,6 +20,11 @@ const ITEM_TYPE = 'anime'; // change to 'series' if items won't open in your cli
 const CATALOG_ID = 'as-dub-recent';
 const OUT_DIR = path.join(__dirname, 'public');
 
+// Optional: RatingPosterDB key. If set (as a GitHub Actions secret RPDB_KEY),
+// posters are replaced with RPDB rating posters. This also sidesteps Kitsu's
+// occasional expiring signed-image URLs. Leave unset to use plain Kitsu art.
+const RPDB_KEY = process.env.RPDB_KEY || '';
+
 // ---------------------------------------------------------------------------
 // MANIFEST
 // ---------------------------------------------------------------------------
@@ -34,7 +39,7 @@ const manifest = {
   resources: ['catalog'],
   types: [ITEM_TYPE],
   idPrefixes: ['kitsu:'],
-  catalogs: [{ type: ITEM_TYPE, id: CATALOG_ID, name: 'Recently Dubbed' }],
+  catalogs: [{ type: ITEM_TYPE, id: CATALOG_ID, name: 'Recently Dubbed', extra: [] }],
   behaviorHints: { configurable: false }
 };
 
@@ -75,15 +80,7 @@ async function resolveKitsuId(title) {
     const json = await res.json();
     const item = json && json.data && json.data[0];
     const result = item
-      ? {
-          id: item.id,
-          poster:
-            (item.attributes &&
-              item.attributes.posterImage &&
-              (item.attributes.posterImage.medium ||
-                item.attributes.posterImage.original)) ||
-            null
-        }
+      ? { id: item.id, posterImage: (item.attributes && item.attributes.posterImage) || null }
       : null;
     kitsuCache.set(title, result);
     return result;
@@ -91,6 +88,28 @@ async function resolveKitsuId(title) {
     kitsuCache.set(title, null);
     return null;
   }
+}
+
+// Pick a poster. With an RPDB key: a stable rating poster (also avoids Kitsu's
+// occasional expiring signed URLs). Without: the first stable Kitsu CDN image,
+// skipping signed/expiring ones. Returns undefined if none is safe (the client
+// then falls back to the title's own art via Anime Kitsu).
+function isStableKitsuUrl(u) {
+  return typeof u === 'string' &&
+    u.startsWith('https://media.kitsu.app/') &&
+    !u.includes('X-Amz-') &&
+    !u.includes('?');
+}
+function posterFor(kitsuId, posterImage) {
+  if (RPDB_KEY) {
+    return `https://api.ratingposterdb.com/${RPDB_KEY}/kitsu/poster-default/${kitsuId}.jpg?fallback=true`;
+  }
+  if (posterImage) {
+    for (const size of ['medium', 'large', 'original', 'small']) {
+      if (isStableKitsuUrl(posterImage[size])) return posterImage[size];
+    }
+  }
+  return undefined;
 }
 
 async function buildMetas() {
@@ -112,7 +131,12 @@ async function buildMetas() {
     const k = await resolveKitsuId(title);
     if (!k || seen.has(k.id)) continue;
     seen.add(k.id);
-    metas.push({ id: `kitsu:${k.id}`, type: ITEM_TYPE, name: title, poster: k.poster });
+    metas.push({
+      id: `kitsu:${k.id}`,
+      type: ITEM_TYPE,
+      name: title,
+      poster: posterFor(k.id, k.posterImage)
+    });
   }
   return metas;
 }
@@ -137,12 +161,25 @@ async function main() {
     path.join(OUT_DIR, 'manifest.json'),
     JSON.stringify(manifest, null, 2)
   );
+  const payload = JSON.stringify({ metas }, null, 2);
+
   await fs.writeFile(
     path.join(catalogDir, `${CATALOG_ID}.json`),
-    JSON.stringify({ metas }, null, 2)
+    payload
   );
 
-  console.log('Wrote public/manifest.json and public/catalog/' + ITEM_TYPE + '/' + CATALOG_ID + '.json');
+  // Stremio/Nuvio often request the catalog with a pagination segment, e.g.
+  // /catalog/anime/as-dub-recent/skip=0.json . A live server computes that;
+  // a static host needs the file to exist. Emit that variant too so every
+  // request shape resolves instead of 404ing.
+  const skipDir = path.join(catalogDir, CATALOG_ID);
+  await fs.mkdir(skipDir, { recursive: true });
+  await fs.writeFile(path.join(skipDir, 'skip=0.json'), payload);
+
+  console.log(
+    'Wrote manifest.json, catalog/' + ITEM_TYPE + '/' + CATALOG_ID + '.json, ' +
+    'and catalog/' + ITEM_TYPE + '/' + CATALOG_ID + '/skip=0.json'
+  );
 }
 
 main().catch((e) => {
