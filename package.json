@@ -1,0 +1,11 @@
+{
+  "name": "animeschedule-dub-static",
+  "version": "0.1.0",
+  "description": "Static Stremio/Nuvio catalog ('Recently Dubbed') generated from AnimeSchedule.net and served on GitHub Pages",
+  "scripts": {
+    "build": "node build.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
