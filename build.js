@@ -30,7 +30,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.2.3',
+  version: '0.2.5',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -101,6 +101,8 @@ async function resolveKitsuId(title) {
   }
 }
 
+// Kitsu numeric id → 'tmdb:<id>' or 'tt...' via Fribb.
+// Prefer TMDB tv ID — resolves natively in Stremio + Nuvio without Cinemeta.
 function mapKitsuToId(kitsuId) {
   const e = fribbByKitsu.get(Number(kitsuId));
   if (!e) return null;
@@ -111,6 +113,10 @@ function mapKitsuToId(kitsuId) {
   return null;
 }
 
+// Poster priority:
+//   1. RPDB rating poster (only when key set AND we have an IMDb tt ID)
+//   2. Stable Kitsu CDN URL (skips signed/expiring X-Amz- URLs)
+//   3. undefined — client falls back to its metadata provider's art
 function posterFor(finalId, kitsuPosterImage) {
   if (RPDB_KEY && finalId.startsWith('tt')) {
     return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${finalId}.jpg?fallback=true`;
@@ -136,45 +142,37 @@ async function buildMetas() {
   console.log(`AnimeSchedule returned ${list.length} raw entries.`);
 
   if (list[0]) {
-    console.log('--- Sample AnimeSchedule dub entry (verify field names) ---');
+    console.log('--- Sample entry ---');
     console.log(JSON.stringify(list[0], null, 2));
-    console.log('-----------------------------------------------------------');
+    console.log('-------------------');
   }
 
-  // Log all episodeDates so we can see what the API is actually returning
-  console.log('--- All entries with episodeDates ---');
-  for (const e of list) {
-    console.log(`  ${pickDate(e) ? new Date(pickDate(e)).toISOString().slice(0,10) : 'NO-DATE'} | ${pickTitle(e)}`);
-  }
-  console.log('-------------------------------------');
-
-  list.sort((a, b) => pickDate(b) - pickDate(a));
+  // Sort: already-aired episodes first (most recent at top), future episodes
+  // at the end (soonest upcoming first). This puts today's/yesterday's dubs
+  // at position 1 rather than Sunday's shows jumping the queue.
+  const now = Date.now();
+  list.sort((a, b) => {
+    const da = pickDate(a), db = pickDate(b);
+    const aFuture = da > now, bFuture = db > now;
+    if (aFuture && !bFuture) return 1;   // a is future, b already aired → b wins
+    if (!aFuture && bFuture) return -1;  // a already aired, b is future → a wins
+    if (!aFuture && !bFuture) return db - da; // both aired: most recent first
+    return da - db;                           // both future: soonest first
+  });
 
   const seen  = new Set();
   const metas = [];
-  let skipNoKitsu = 0;
-  let skipNoFribb = 0;
+  let skipped = 0;
 
   for (const entry of list) {
     const title = pickTitle(entry);
     const k     = await resolveKitsuId(title);
-    if (!k) {
-      skipNoKitsu++;
-      console.log(`SKIP no-kitsu: "${title}"`);
-      continue;
-    }
+    if (!k) { skipped++; continue; }
 
     const finalId = mapKitsuToId(k.id);
-    if (!finalId) {
-      skipNoFribb++;
-      console.log(`SKIP no-fribb: "${title}" (kitsu:${k.id})`);
-      continue;
-    }
+    if (!finalId) { skipped++; continue; }
 
-    if (seen.has(finalId)) {
-      console.log(`DEDUP: "${title}" → ${finalId}`);
-      continue;
-    }
+    if (seen.has(finalId)) continue;
     seen.add(finalId);
 
     metas.push({
@@ -185,9 +183,7 @@ async function buildMetas() {
     });
   }
 
-  console.log(`\nBuilt ${metas.length} items.`);
-  console.log(`Skipped ${skipNoKitsu} (no Kitsu hit), ${skipNoFribb} (no Fribb mapping).`);
-  console.log('Final list:', metas.map(m => `${m.name} → ${m.id}`).join('\n'));
+  console.log(`Built ${metas.length} items; skipped ${skipped} (no Kitsu hit or no Fribb mapping).`);
   return metas;
 }
 
@@ -210,12 +206,13 @@ async function main() {
   const payload = JSON.stringify({ metas }, null, 2);
   await fs.writeFile(path.join(catalogDir, `${CATALOG_ID}.json`), payload);
 
+  // Some clients request the paginated path .../skip=0.json — emit it too.
   const skipDir = path.join(catalogDir, CATALOG_ID);
   await fs.mkdir(skipDir, { recursive: true });
   await fs.writeFile(path.join(skipDir, 'skip=0.json'), payload);
 
   console.log(
-    '\nWrote manifest.json, ' +
+    'Wrote manifest.json, ' +
     `catalog/${ITEM_TYPE}/${CATALOG_ID}.json, ` +
     `catalog/${ITEM_TYPE}/${CATALOG_ID}/skip=0.json`
   );
