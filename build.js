@@ -32,16 +32,17 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.2.0',
+  version: '0.2.1',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
     'IMDb/TMDB IDs so your client can pull full metadata and find streams.',
+  logo: 'https://animeschedule.net/favicon.ico',
   resources: ['catalog'],
   types: [ITEM_TYPE],
   idPrefixes: ['tt', 'tmdb:'],
   catalogs: [{ type: ITEM_TYPE, id: CATALOG_ID, name: 'Recently Dubbed', extra: [] }],
-  behaviorHints: { configurable: false }
+  behaviorHints: { configurable: true, configurationRequired: false }
 };
 
 // ---------------------------------------------------------------------------
