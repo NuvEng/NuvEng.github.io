@@ -4,8 +4,8 @@
 //   public/catalog/<type>/<id>.json   (+ /skip=0.json variant)
 //
 // Each AnimeSchedule dub entry is resolved to a Kitsu ID, then mapped to a
-// real IMDb / TMDB ID via Fribb's anime-lists. Emitting IMDb/TMDB IDs (not
-// kitsu: IDs) is what lets Nuvio/Cinemeta pull full metadata and find streams.
+// real TMDB / IMDb ID via Fribb's anime-lists. Emitting TMDB IDs natively
+// resolves in Stremio + Nuvio without requiring Cinemeta.
 
 const fs = require('fs/promises');
 const path = require('path');
@@ -16,7 +16,7 @@ const path = require('path');
 const AS_TOKEN = process.env.ANIMESCHEDULE_TOKEN;  // GitHub Actions secret
 const RPDB_KEY = process.env.RPDB_KEY || '';       // optional secret
 
-const AS_BASE        = 'https://animeschedule.net/api/v3';
+const AS_BASE         = 'https://animeschedule.net/api/v3';
 const AS_DUB_ENDPOINT = `${AS_BASE}/timetables/dub`;
 const FRIBB_URL =
   'https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json';
@@ -32,15 +32,15 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.2.1',
+  version: '0.2.2',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
-    'IMDb/TMDB IDs so your client can pull full metadata and find streams.',
+    'TMDB/IMDb IDs so your client can pull full metadata and find streams.',
   logo: 'https://animeschedule.net/favicon.ico',
   resources: ['catalog'],
   types: [ITEM_TYPE],
-  idPrefixes: ['tt', 'tmdb:'],
+  idPrefixes: ['tmdb:', 'tt'],
   catalogs: [{ type: ITEM_TYPE, id: CATALOG_ID, name: 'Recently Dubbed', extra: [] }],
   behaviorHints: { configurable: true, configurationRequired: false }
 };
@@ -48,8 +48,8 @@ const manifest = {
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
-const kitsuCache  = new Map();
-let fribbByKitsu  = null; // Map<number, fribbEntry> — loaded once
+const kitsuCache = new Map();
+let fribbByKitsu = null; // Map<number, fribbEntry> — loaded once
 
 async function fetchDubTimetable() {
   const res = await fetch(AS_DUB_ENDPOINT, {
@@ -104,16 +104,17 @@ async function resolveKitsuId(title) {
   }
 }
 
-// Kitsu numeric id → 'tt...' or 'tmdb:<id>' via Fribb.
-// Prefer IMDb (universal, works in Cinemeta + Nuvio); fall back to TMDB.
+// Kitsu numeric id → 'tmdb:<id>' or 'tt...' via Fribb.
+// Prefer TMDB tv ID — resolves natively in Stremio + Nuvio without Cinemeta.
+// Fall back to IMDb tt if no TMDB tv ID exists (e.g. some movies/older shows).
 // Returns null if no mapping exists — item is unresolvable and will be dropped.
 function mapKitsuToId(kitsuId) {
   const e = fribbByKitsu.get(Number(kitsuId));
   if (!e) return null;
-  if (e.imdb_id) return e.imdb_id;                    // e.g. "tt1164545"
   const tmdb = e.themoviedb_id || {};
-  if (tmdb.tv)    return `tmdb:${tmdb.tv}`;
-  if (tmdb.movie) return `tmdb:${tmdb.movie}`;
+  if (tmdb.tv)    return `tmdb:${tmdb.tv}`;    // primary: native in all clients
+  if (e.imdb_id)  return e.imdb_id;            // fallback: needs Cinemeta
+  if (tmdb.movie) return `tmdb:${tmdb.movie}`; // last resort
   return null;
 }
 
@@ -164,9 +165,9 @@ async function buildMetas() {
     if (!k) { skipped++; continue; }
 
     const finalId = mapKitsuToId(k.id);
-    if (!finalId) { skipped++; continue; }   // no IMDb/TMDB mapping in Fribb
+    if (!finalId) { skipped++; continue; }  // no TMDB/IMDb mapping in Fribb
 
-    if (seen.has(finalId)) continue;         // collapse multiple seasons → one row
+    if (seen.has(finalId)) continue;        // collapse multiple seasons → one row
     seen.add(finalId);
 
     metas.push({
@@ -179,7 +180,7 @@ async function buildMetas() {
 
   console.log(
     `Built ${metas.length} items; skipped ${skipped} ` +
-    `(no Kitsu hit or no IMDb/TMDB mapping in Fribb).`
+    `(no Kitsu hit or no TMDB/IMDb mapping in Fribb).`
   );
   return metas;
 }
