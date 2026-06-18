@@ -21,8 +21,6 @@ const AS_DUB_ENDPOINT = `${AS_BASE}/timetables/dub`;
 const FRIBB_URL =
   'https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json';
 
-// Dub timetables are weekly TV airings, so the catalog is a 'series' row and
-// every item is emitted as a series.
 const ITEM_TYPE  = 'series';
 const CATALOG_ID = 'as-dub-recent';
 const OUT_DIR    = path.join(__dirname, 'public');
@@ -32,7 +30,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.2.2',
+  version: '0.2.3',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -49,7 +47,7 @@ const manifest = {
 // HELPERS
 // ---------------------------------------------------------------------------
 const kitsuCache = new Map();
-let fribbByKitsu = null; // Map<number, fribbEntry> — loaded once
+let fribbByKitsu = null;
 
 async function fetchDubTimetable() {
   const res = await fetch(AS_DUB_ENDPOINT, {
@@ -72,7 +70,6 @@ async function loadFribbMapping() {
   return fribbByKitsu;
 }
 
-// Field-name fallback chain — verify against the Actions log dump below.
 function pickTitle(entry) {
   return entry.english || entry.romaji || entry.title || entry.native || null;
 }
@@ -104,24 +101,16 @@ async function resolveKitsuId(title) {
   }
 }
 
-// Kitsu numeric id → 'tmdb:<id>' or 'tt...' via Fribb.
-// Prefer TMDB tv ID — resolves natively in Stremio + Nuvio without Cinemeta.
-// Fall back to IMDb tt if no TMDB tv ID exists (e.g. some movies/older shows).
-// Returns null if no mapping exists — item is unresolvable and will be dropped.
 function mapKitsuToId(kitsuId) {
   const e = fribbByKitsu.get(Number(kitsuId));
   if (!e) return null;
   const tmdb = e.themoviedb_id || {};
-  if (tmdb.tv)    return `tmdb:${tmdb.tv}`;    // primary: native in all clients
-  if (e.imdb_id)  return e.imdb_id;            // fallback: needs Cinemeta
-  if (tmdb.movie) return `tmdb:${tmdb.movie}`; // last resort
+  if (tmdb.tv)    return `tmdb:${tmdb.tv}`;
+  if (e.imdb_id)  return e.imdb_id;
+  if (tmdb.movie) return `tmdb:${tmdb.movie}`;
   return null;
 }
 
-// Poster priority:
-//   1. RPDB rating poster  (only when key set AND we have an IMDb tt ID)
-//   2. Stable Kitsu CDN URL (skips signed/expiring X-Amz- URLs)
-//   3. undefined — client falls back to its own metadata provider's art
 function posterFor(finalId, kitsuPosterImage) {
   if (RPDB_KEY && finalId.startsWith('tt')) {
     return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${finalId}.jpg?fallback=true`;
@@ -141,33 +130,51 @@ function posterFor(finalId, kitsuPosterImage) {
 }
 
 async function buildMetas() {
-  // Kick off both network fetches in parallel — Fribb JSON is ~3 MB so this
-  // saves meaningful wall-clock time on the Actions runner.
   const [timetable] = await Promise.all([fetchDubTimetable(), loadFribbMapping()]);
 
   const list = Array.isArray(timetable) ? timetable : [];
+  console.log(`AnimeSchedule returned ${list.length} raw entries.`);
+
   if (list[0]) {
     console.log('--- Sample AnimeSchedule dub entry (verify field names) ---');
     console.log(JSON.stringify(list[0], null, 2));
     console.log('-----------------------------------------------------------');
   }
 
-  // Most-recent episodes first.
+  // Log all episodeDates so we can see what the API is actually returning
+  console.log('--- All entries with episodeDates ---');
+  for (const e of list) {
+    console.log(`  ${pickDate(e) ? new Date(pickDate(e)).toISOString().slice(0,10) : 'NO-DATE'} | ${pickTitle(e)}`);
+  }
+  console.log('-------------------------------------');
+
   list.sort((a, b) => pickDate(b) - pickDate(a));
 
   const seen  = new Set();
   const metas = [];
-  let skipped = 0;
+  let skipNoKitsu = 0;
+  let skipNoFribb = 0;
 
   for (const entry of list) {
     const title = pickTitle(entry);
     const k     = await resolveKitsuId(title);
-    if (!k) { skipped++; continue; }
+    if (!k) {
+      skipNoKitsu++;
+      console.log(`SKIP no-kitsu: "${title}"`);
+      continue;
+    }
 
     const finalId = mapKitsuToId(k.id);
-    if (!finalId) { skipped++; continue; }  // no TMDB/IMDb mapping in Fribb
+    if (!finalId) {
+      skipNoFribb++;
+      console.log(`SKIP no-fribb: "${title}" (kitsu:${k.id})`);
+      continue;
+    }
 
-    if (seen.has(finalId)) continue;        // collapse multiple seasons → one row
+    if (seen.has(finalId)) {
+      console.log(`DEDUP: "${title}" → ${finalId}`);
+      continue;
+    }
     seen.add(finalId);
 
     metas.push({
@@ -178,10 +185,9 @@ async function buildMetas() {
     });
   }
 
-  console.log(
-    `Built ${metas.length} items; skipped ${skipped} ` +
-    `(no Kitsu hit or no TMDB/IMDb mapping in Fribb).`
-  );
+  console.log(`\nBuilt ${metas.length} items.`);
+  console.log(`Skipped ${skipNoKitsu} (no Kitsu hit), ${skipNoFribb} (no Fribb mapping).`);
+  console.log('Final list:', metas.map(m => `${m.name} → ${m.id}`).join('\n'));
   return metas;
 }
 
@@ -204,14 +210,12 @@ async function main() {
   const payload = JSON.stringify({ metas }, null, 2);
   await fs.writeFile(path.join(catalogDir, `${CATALOG_ID}.json`), payload);
 
-  // Some clients request the paginated path /catalog/series/as-dub-recent/skip=0.json
-  // even for the first page. Emit it as a duplicate so it doesn't 404.
   const skipDir = path.join(catalogDir, CATALOG_ID);
   await fs.mkdir(skipDir, { recursive: true });
   await fs.writeFile(path.join(skipDir, 'skip=0.json'), payload);
 
   console.log(
-    'Wrote manifest.json, ' +
+    '\nWrote manifest.json, ' +
     `catalog/${ITEM_TYPE}/${CATALOG_ID}.json, ` +
     `catalog/${ITEM_TYPE}/${CATALOG_ID}/skip=0.json`
   );
