@@ -30,7 +30,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.2.5',
+  version: '0.2.6',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -103,13 +103,16 @@ async function resolveKitsuId(title) {
 
 // Kitsu numeric id → 'tmdb:<id>' or 'tt...' via Fribb.
 // Prefer TMDB tv ID — resolves natively in Stremio + Nuvio without Cinemeta.
+// ALWAYS returns a string or null — never a bare number — so downstream
+// string methods (startsWith etc.) never blow up on a malformed Fribb row.
 function mapKitsuToId(kitsuId) {
   const e = fribbByKitsu.get(Number(kitsuId));
   if (!e) return null;
+
   const tmdb = e.themoviedb_id || {};
-  if (tmdb.tv)    return `tmdb:${tmdb.tv}`;
-  if (e.imdb_id)  return e.imdb_id;
-  if (tmdb.movie) return `tmdb:${tmdb.movie}`;
+  if (tmdb.tv != null && tmdb.tv !== '')       return `tmdb:${tmdb.tv}`;
+  if (typeof e.imdb_id === 'string' && e.imdb_id.startsWith('tt')) return e.imdb_id;
+  if (tmdb.movie != null && tmdb.movie !== '') return `tmdb:${tmdb.movie}`;
   return null;
 }
 
@@ -118,8 +121,10 @@ function mapKitsuToId(kitsuId) {
 //   2. Stable Kitsu CDN URL (skips signed/expiring X-Amz- URLs)
 //   3. undefined — client falls back to its metadata provider's art
 function posterFor(finalId, kitsuPosterImage) {
-  if (RPDB_KEY && finalId.startsWith('tt')) {
-    return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${finalId}.jpg?fallback=true`;
+  const id = typeof finalId === 'string' ? finalId : String(finalId || '');
+
+  if (RPDB_KEY && id.startsWith('tt')) {
+    return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${id}.jpg?fallback=true`;
   }
   if (kitsuPosterImage) {
     for (const size of ['medium', 'large', 'original', 'small']) {
@@ -148,16 +153,15 @@ async function buildMetas() {
   }
 
   // Sort: already-aired episodes first (most recent at top), future episodes
-  // at the end (soonest upcoming first). This puts today's/yesterday's dubs
-  // at position 1 rather than Sunday's shows jumping the queue.
+  // at the end (soonest upcoming first).
   const now = Date.now();
   list.sort((a, b) => {
     const da = pickDate(a), db = pickDate(b);
     const aFuture = da > now, bFuture = db > now;
-    if (aFuture && !bFuture) return 1;   // a is future, b already aired → b wins
-    if (!aFuture && bFuture) return -1;  // a already aired, b is future → a wins
-    if (!aFuture && !bFuture) return db - da; // both aired: most recent first
-    return da - db;                           // both future: soonest first
+    if (aFuture && !bFuture) return 1;
+    if (!aFuture && bFuture) return -1;
+    if (!aFuture && !bFuture) return db - da;
+    return da - db;
   });
 
   const seen  = new Set();
@@ -170,7 +174,7 @@ async function buildMetas() {
     if (!k) { skipped++; continue; }
 
     const finalId = mapKitsuToId(k.id);
-    if (!finalId) { skipped++; continue; }
+    if (typeof finalId !== 'string' || !finalId) { skipped++; continue; }
 
     if (seen.has(finalId)) continue;
     seen.add(finalId);
@@ -206,7 +210,6 @@ async function main() {
   const payload = JSON.stringify({ metas }, null, 2);
   await fs.writeFile(path.join(catalogDir, `${CATALOG_ID}.json`), payload);
 
-  // Some clients request the paginated path .../skip=0.json — emit it too.
   const skipDir = path.join(catalogDir, CATALOG_ID);
   await fs.mkdir(skipDir, { recursive: true });
   await fs.writeFile(path.join(skipDir, 'skip=0.json'), payload);
