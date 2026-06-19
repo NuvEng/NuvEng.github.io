@@ -6,6 +6,10 @@
 // Each AnimeSchedule dub entry is resolved to a Kitsu ID, then mapped to a
 // real TMDB / IMDb ID via Fribb's anime-lists. Emitting TMDB IDs natively
 // resolves in Stremio + Nuvio without requiring Cinemeta.
+//
+// DEBUG BUILD: temporarily logs the raw "Kobayashi" entry (if present) so we
+// can see exactly what episodeDate/title fields AnimeSchedule's API returns
+// for it. Remove this block once diagnosed.
 
 const fs = require('fs/promises');
 const path = require('path');
@@ -30,7 +34,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.2.6',
+  version: '0.2.7-debug',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -102,13 +106,9 @@ async function resolveKitsuId(title) {
 }
 
 // Kitsu numeric id → 'tmdb:<id>' or 'tt...' via Fribb.
-// Prefer TMDB tv ID — resolves natively in Stremio + Nuvio without Cinemeta.
-// ALWAYS returns a string or null — never a bare number — so downstream
-// string methods (startsWith etc.) never blow up on a malformed Fribb row.
 function mapKitsuToId(kitsuId) {
   const e = fribbByKitsu.get(Number(kitsuId));
   if (!e) return null;
-
   const tmdb = e.themoviedb_id || {};
   if (tmdb.tv != null && tmdb.tv !== '')       return `tmdb:${tmdb.tv}`;
   if (typeof e.imdb_id === 'string' && e.imdb_id.startsWith('tt')) return e.imdb_id;
@@ -116,10 +116,6 @@ function mapKitsuToId(kitsuId) {
   return null;
 }
 
-// Poster priority:
-//   1. RPDB rating poster (only when key set AND we have an IMDb tt ID)
-//   2. Stable Kitsu CDN URL (skips signed/expiring X-Amz- URLs)
-//   3. undefined — client falls back to its metadata provider's art
 function posterFor(finalId, kitsuPosterImage) {
   const id = typeof finalId === 'string' ? finalId : String(finalId || '');
 
@@ -146,10 +142,23 @@ async function buildMetas() {
   const list = Array.isArray(timetable) ? timetable : [];
   console.log(`AnimeSchedule returned ${list.length} raw entries.`);
 
+  // --- DEBUG: dump the raw Kobayashi entry, if present -----------------
+  const kobayashi = list.find(
+    (e) => pickTitle(e) && pickTitle(e).toLowerCase().includes('kobayashi')
+  );
+  if (kobayashi) {
+    console.log('--- KOBAYASHI ENTRY (raw, full) ---');
+    console.log(JSON.stringify(kobayashi, null, 2));
+    console.log('------------------------------------');
+  } else {
+    console.log('No entry with "kobayashi" in its title was found in this run.');
+  }
+  // -----------------------------------------------------------------------
+
   if (list[0]) {
-    console.log('--- Sample entry ---');
+    console.log('--- Sample entry (first in raw list) ---');
     console.log(JSON.stringify(list[0], null, 2));
-    console.log('-------------------');
+    console.log('-----------------------------------------');
   }
 
   // Sort: already-aired episodes first (most recent at top), future episodes
@@ -188,6 +197,7 @@ async function buildMetas() {
   }
 
   console.log(`Built ${metas.length} items; skipped ${skipped} (no Kitsu hit or no Fribb mapping).`);
+  console.log('Top 5 final order:', metas.slice(0, 5).map((m) => m.name));
   return metas;
 }
 
