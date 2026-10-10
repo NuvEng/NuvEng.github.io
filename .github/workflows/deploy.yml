@@ -33,6 +33,8 @@ jobs:
         env:
           ANIMESCHEDULE_TOKEN: ${{ secrets.ANIMESCHEDULE_TOKEN }}
           RPDB_KEY: ${{ secrets.RPDB_KEY }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          MDBLIST_API_KEY: ${{ secrets.MDBLIST_API_KEY }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
