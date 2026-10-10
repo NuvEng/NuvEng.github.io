@@ -19,9 +19,14 @@ const path = require('path');
 // ---------------------------------------------------------------------------
 const AS_TOKEN = process.env.ANIMESCHEDULE_TOKEN;  // GitHub Actions secret
 const RPDB_KEY = process.env.RPDB_KEY || '';       // optional secret
+const TMDB_KEY = process.env.TMDB_API_KEY || '';   // optional secret (v3 key or v4 read token)
+const MDBLIST_KEY = process.env.MDBLIST_API_KEY || ''; // optional secret
 
 const AS_BASE         = 'https://animeschedule.net/api/v3';
 const AS_DUB_ENDPOINT = `${AS_BASE}/timetables/dub`;
+const TMDB_BASE = 'https://api.themoviedb.org/3';
+const TMDB_IMG  = 'https://image.tmdb.org/t/p';
+const MDBLIST_BASE = 'https://api.mdblist.com';
 const FRIBB_URL =
   'https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json';
 
@@ -34,7 +39,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.2.7-debug',
+  version: '0.4.0',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -110,18 +115,20 @@ function mapKitsuToId(kitsuId) {
   const e = fribbByKitsu.get(Number(kitsuId));
   if (!e) return null;
   const tmdb = e.themoviedb_id || {};
-  if (tmdb.tv != null && tmdb.tv !== '')       return `tmdb:${tmdb.tv}`;
-  if (typeof e.imdb_id === 'string' && e.imdb_id.startsWith('tt')) return e.imdb_id;
-  if (tmdb.movie != null && tmdb.movie !== '') return `tmdb:${tmdb.movie}`;
+  if (tmdb.tv != null && tmdb.tv !== '')       return { id: `tmdb:${tmdb.tv}`, tmdbType: 'tv' };
+  if (typeof e.imdb_id === 'string' && e.imdb_id.startsWith('tt')) return { id: e.imdb_id, tmdbType: null };
+  if (tmdb.movie != null && tmdb.movie !== '') return { id: `tmdb:${tmdb.movie}`, tmdbType: 'movie' };
   return null;
 }
 
-function posterFor(finalId, kitsuPosterImage) {
+function posterFor(finalId, kitsuPosterImage, imdbId, tmdbPoster) {
   const id = typeof finalId === 'string' ? finalId : String(finalId || '');
+  const tt = id.startsWith('tt') ? id : imdbId;
 
-  if (RPDB_KEY && id.startsWith('tt')) {
-    return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${id}.jpg?fallback=true`;
+  if (RPDB_KEY && tt) {
+    return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${tt}.jpg?fallback=true`;
   }
+  if (tmdbPoster) return tmdbPoster;
   if (kitsuPosterImage) {
     for (const size of ['medium', 'large', 'original', 'small']) {
       const u = kitsuPosterImage[size];
@@ -134,6 +141,127 @@ function posterFor(finalId, kitsuPosterImage) {
     }
   }
   return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// TMDB ENRICHMENT (optional — skipped if TMDB_API_KEY is not set)
+// ---------------------------------------------------------------------------
+const tmdbCache = new Map();
+
+async function tmdbGet(pathAndQuery) {
+  if (!TMDB_KEY) return null;
+  // v4 "API Read Access Token" is a long JWT (starts with eyJ); v3 key is 32 hex chars.
+  const isBearer = TMDB_KEY.startsWith('eyJ');
+  const sep = pathAndQuery.includes('?') ? '&' : '?';
+  const url = `${TMDB_BASE}${pathAndQuery}${sep}language=en-US` +
+              (isBearer ? '' : `&api_key=${TMDB_KEY}`);
+  const headers = { Accept: 'application/json' };
+  if (isBearer) headers.Authorization = `Bearer ${TMDB_KEY}`;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers });
+      if (res.status === 429) { await new Promise((r) => setTimeout(r, 1500)); continue; }
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+  return null;
+}
+
+// finalId is 'tmdb:<id>' or 'tt...'. tmdbType is 'tv' or 'movie' (hint from Fribb).
+async function fetchTmdbDetails(finalId, tmdbType) {
+  const key = `${finalId}|${tmdbType}`;
+  if (tmdbCache.has(key)) return tmdbCache.get(key);
+
+  let data = null;
+  let kind = tmdbType || 'tv';
+
+  if (finalId.startsWith('tmdb:')) {
+    const id = finalId.slice(5);
+    data = await tmdbGet(`/${kind}/${id}?append_to_response=external_ids`);
+  } else if (finalId.startsWith('tt')) {
+    const found = await tmdbGet(`/find/${finalId}?external_source=imdb_id`);
+    const hit = found && ((found.tv_results && found.tv_results[0]) ||
+                          (found.movie_results && found.movie_results[0]));
+    if (hit) {
+      kind = found.tv_results && found.tv_results[0] ? 'tv' : 'movie';
+      data = await tmdbGet(`/${kind}/${hit.id}?append_to_response=external_ids`);
+    }
+  }
+
+  tmdbCache.set(key, data);
+  return data;
+}
+
+function tmdbToMetaFields(d) {
+  if (!d) return {};
+  const date  = d.first_air_date || d.release_date || '';
+  const imdb  = (d.external_ids && d.external_ids.imdb_id) || d.imdb_id || null;
+  const out = {
+    description: d.overview || undefined,
+    background:  d.backdrop_path ? `${TMDB_IMG}/original${d.backdrop_path}` : undefined,
+    tmdbPoster:  d.poster_path   ? `${TMDB_IMG}/w500${d.poster_path}`       : undefined,
+    releaseInfo: date ? date.slice(0, 4) : undefined,
+    genres:      Array.isArray(d.genres) ? d.genres.map((g) => g.name) : undefined,
+    imdbRating:  d.vote_average ? d.vote_average.toFixed(1) : undefined,
+    imdbId:      typeof imdb === 'string' && imdb.startsWith('tt') ? imdb : undefined
+  };
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// MDBLIST RATINGS (optional — skipped if MDBLIST_API_KEY is not set)
+// Free tier allows ~1000 requests/day; one request per title per run.
+// ---------------------------------------------------------------------------
+const RATING_LABELS = {
+  imdb: 'IMDb', mal: 'MAL', tomatoes: 'RT', metacritic: 'MC',
+  trakt: 'Trakt', letterboxd: 'LB', tmdb: 'TMDB'
+};
+let mdblistDisabled = false;
+
+async function fetchMdblist(imdbId, tmdbId, tmdbType) {
+  if (!MDBLIST_KEY || mdblistDisabled) return null;
+  const mediaType = tmdbType === 'movie' ? 'movie' : 'show';
+  const url = imdbId
+    ? `${MDBLIST_BASE}/imdb/${mediaType}/${imdbId}?apikey=${MDBLIST_KEY}`
+    : tmdbId
+      ? `${MDBLIST_BASE}/tmdb/${mediaType}/${tmdbId}?apikey=${MDBLIST_KEY}`
+      : null;
+  if (!url) return null;
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (res.status === 429 || res.status === 401 || res.status === 403) {
+      console.log(`MDBList responded ${res.status} — disabling MDBList for the rest of this run.`);
+      mdblistDisabled = true;
+      return null;
+    }
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+function mdblistToFields(m) {
+  if (!m || !Array.isArray(m.ratings)) return {};
+  const by = {};
+  for (const r of m.ratings) {
+    if (r && r.source && r.value != null && r.value !== 0) by[r.source] = r.value;
+  }
+  const parts = [];
+  for (const src of ['imdb', 'mal', 'tomatoes', 'letterboxd']) {
+    if (by[src] == null) continue;
+    const v = src === 'tomatoes' ? `${by[src]}%` : by[src];
+    parts.push(`${RATING_LABELS[src]} ${v}`);
+  }
+  return {
+    imdbRating:  by.imdb != null ? String(by.imdb) : undefined,
+    ratingsLine: parts.length ? `⭐ ${parts.join(' · ')}` : undefined,
+    certification: m.certification || undefined
+  };
 }
 
 async function buildMetas() {
@@ -176,27 +304,48 @@ async function buildMetas() {
   const seen  = new Set();
   const metas = [];
   let skipped = 0;
+  let enriched = 0;
+  let rated = 0;
+  if (!MDBLIST_KEY) console.log('MDBLIST_API_KEY not set — skipping MDBList ratings.');
+  if (!TMDB_KEY) console.log('TMDB_API_KEY not set — skipping TMDB enrichment.');
 
   for (const entry of list) {
     const title = pickTitle(entry);
     const k     = await resolveKitsuId(title);
     if (!k) { skipped++; continue; }
 
-    const finalId = mapKitsuToId(k.id);
-    if (typeof finalId !== 'string' || !finalId) { skipped++; continue; }
+    const mapped = mapKitsuToId(k.id);
+    if (!mapped || !mapped.id) { skipped++; continue; }
+    const finalId = mapped.id;
 
     if (seen.has(finalId)) continue;
     seen.add(finalId);
 
+    const t = tmdbToMetaFields(await fetchTmdbDetails(finalId, mapped.tmdbType));
+    if (t.description) enriched++;
+
+    const imdbId = finalId.startsWith('tt') ? finalId : t.imdbId;
+    const tmdbId = finalId.startsWith('tmdb:') ? finalId.slice(5) : null;
+    const md = mdblistToFields(await fetchMdblist(imdbId, tmdbId, mapped.tmdbType));
+    if (md.ratingsLine) rated++;
+
+    const description = [md.ratingsLine, t.description].filter(Boolean).join('\n\n') || undefined;
+
     metas.push({
-      id:     finalId,
-      type:   ITEM_TYPE,
-      name:   title,
-      poster: posterFor(finalId, k.posterImage)
+      id:          finalId,
+      type:        ITEM_TYPE,
+      name:        title,
+      poster:      posterFor(finalId, k.posterImage, t.imdbId, t.tmdbPoster),
+      posterShape: 'poster',
+      background:  t.background,
+      description: description,
+      releaseInfo: t.releaseInfo,
+      genres:      t.genres,
+      imdbRating:  md.imdbRating || t.imdbRating
     });
   }
 
-  console.log(`Built ${metas.length} items; skipped ${skipped} (no Kitsu hit or no Fribb mapping).`);
+  console.log(`Built ${metas.length} items; skipped ${skipped} (no Kitsu hit or no Fribb mapping); TMDB-enriched ${enriched}; MDBList-rated ${rated}.`);
   console.log('Top 5 final order:', metas.slice(0, 5).map((m) => m.name));
   return metas;
 }
