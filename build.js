@@ -20,6 +20,10 @@ const path = require('path');
 const AS_TOKEN = process.env.ANIMESCHEDULE_TOKEN;  // GitHub Actions secret
 const RPDB_KEY = process.env.RPDB_KEY || '';       // optional secret
 const USE_RPDB = process.env.USE_RPDB === 'true';  // opt-in
+const POSTER_TEMPLATE = 'https://btttr.cc/poster/imdb/poster-default/{imdb_id}.jpg';
+// Optional poster URL pattern (e.g. BetterPosters / btttr.cc "poster-only" URL).
+// Placeholders: {imdb_id} {tmdb_id} {type} (movie|series) {tmdb_type} (movie|tv)
+const POSTER_PATTERN = process.env.POSTER_URL_PATTERN || '';
 const TMDB_KEY = process.env.TMDB_API_KEY || '';   // optional secret (v3 key or v4 read token)
 const MDBLIST_KEY = process.env.MDBLIST_API_KEY || ''; // optional secret
 
@@ -40,7 +44,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.4.1',
+  version: '0.5.0',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -122,12 +126,28 @@ function mapKitsuToId(kitsuId) {
   return null;
 }
 
-function posterFor(finalId, kitsuPosterImage, imdbId, tmdbPoster) {
+function fromPattern(tt, tmdbId, tmdbType) {
+  if (!POSTER_PATTERN) return undefined;
+  const needsImdb = /\{imdb(_id)?\}/.test(POSTER_PATTERN);
+  const needsTmdb = /\{tmdb(_id)?\}/.test(POSTER_PATTERN);
+  if ((needsImdb && !tt) || (needsTmdb && !tmdbId)) return undefined;
+  const kind = tmdbType === 'movie' ? 'movie' : 'series';
+  return POSTER_PATTERN
+    .replace(/\{imdb(_id)?\}/g, tt || '')
+    .replace(/\{tmdb(_id)?\}/g, tmdbId || '')
+    .replace(/\{tmdb_type\}/g, tmdbType === 'movie' ? 'movie' : 'tv')
+    .replace(/\{type\}/g, kind);
+}
+
+function posterFor(finalId, kitsuPosterImage, imdbId, tmdbPoster, tmdbId, tmdbType) {
   const id = typeof finalId === 'string' ? finalId : String(finalId || '');
   const tt = id.startsWith('tt') ? id : imdbId;
 
-  // TMDB posters first: fast CDN, always load. RPDB only fills gaps, and only
-  // when USE_RPDB=true is set (RPDB images fail silently if the key expires).
+  const custom = fromPattern(tt, tmdbId, tmdbType);
+  if (custom) return custom;
+
+  // btttr.cc rating posters for anything with an IMDb ID; TMDB poster otherwise.
+  if (tt) return POSTER_TEMPLATE.replace('{imdb_id}', tt);
   if (tmdbPoster) return tmdbPoster;
   if (RPDB_KEY && USE_RPDB && tt) {
     return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${tt}.jpg?fallback=true`;
@@ -210,7 +230,8 @@ function tmdbToMetaFields(d) {
     releaseInfo: date ? date.slice(0, 4) : undefined,
     genres:      Array.isArray(d.genres) ? d.genres.map((g) => g.name) : undefined,
     imdbRating:  d.vote_average ? d.vote_average.toFixed(1) : undefined,
-    imdbId:      typeof imdb === 'string' && imdb.startsWith('tt') ? imdb : undefined
+    imdbId:      typeof imdb === 'string' && imdb.startsWith('tt') ? imdb : undefined,
+    tmdbId:      d.id != null ? String(d.id) : undefined
   };
   return out;
 }
@@ -309,6 +330,7 @@ async function buildMetas() {
   let skipped = 0;
   let enriched = 0;
   let rated = 0;
+  console.log(POSTER_PATTERN ? 'Using custom POSTER_URL_PATTERN for posters.' : 'No POSTER_URL_PATTERN — using TMDB posters.');
   if (!MDBLIST_KEY) console.log('MDBLIST_API_KEY not set — skipping MDBList ratings.');
   if (!TMDB_KEY) console.log('TMDB_API_KEY not set — skipping TMDB enrichment.');
 
@@ -338,7 +360,7 @@ async function buildMetas() {
       id:          finalId,
       type:        ITEM_TYPE,
       name:        title,
-      poster:      posterFor(finalId, k.posterImage, t.imdbId, t.tmdbPoster),
+      poster:      posterFor(finalId, k.posterImage, t.imdbId, t.tmdbPoster, tmdbId || t.tmdbId, mapped.tmdbType),
       posterShape: 'poster',
       background:  t.background,
       description: description,
