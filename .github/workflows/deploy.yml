@@ -28,6 +28,10 @@ jobs:
         with:
           node-version: 20
       - run: npm ci || npm install
+      - name: Install poster label font
+        run: sudo apt-get install -y --no-install-recommends fonts-liberation || true
+      - id: pages
+        uses: actions/configure-pages@v5
       - name: Build static addon files
         run: node build.js
         env:
@@ -35,7 +39,8 @@ jobs:
           RPDB_KEY: ${{ secrets.RPDB_KEY }}
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
           MDBLIST_API_KEY: ${{ secrets.MDBLIST_API_KEY }}
-      - uses: actions/configure-pages@v5
+          POSTER_URL_PATTERN: ${{ secrets.POSTER_URL_PATTERN }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: ./public
