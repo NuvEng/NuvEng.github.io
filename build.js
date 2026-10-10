@@ -57,7 +57,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.6.2',
+  version: '0.8.2',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -76,12 +76,36 @@ const manifest = {
 const kitsuCache = new Map();
 let fribbByKitsu = null;
 
+// ISO-8601 week number + week-year for a date.
+function isoWeek(date) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return { year: d.getUTCFullYear(), week: Math.ceil(((d - yearStart) / 86400000 + 1) / 7) };
+}
+
+// The timetable endpoint only returns one week, so fetch this week AND last
+// week; otherwise the row empties out every Monday. Last week is best-effort.
 async function fetchDubTimetable() {
-  const res = await fetch(AS_DUB_ENDPOINT, {
-    headers: { Authorization: `Bearer ${AS_TOKEN}` }
-  });
+  const headers = { Authorization: `Bearer ${AS_TOKEN}` };
+  const res = await fetch(AS_DUB_ENDPOINT, { headers });
   if (!res.ok) throw new Error(`AnimeSchedule responded ${res.status} ${res.statusText}`);
-  return res.json();
+  const current = await res.json();
+
+  let previous = [];
+  try {
+    const { year, week } = isoWeek(new Date(Date.now() - 7 * 86400000));
+    const prev = await fetch(`${AS_DUB_ENDPOINT}?year=${year}&week=${week}`, { headers });
+    if (prev.ok) previous = await prev.json();
+    else console.log(`Previous week (${year}-W${week}) responded ${prev.status} — using this week only.`);
+  } catch (e) {
+    console.log('Previous week fetch failed — using this week only.');
+  }
+  const cur  = Array.isArray(current)  ? current  : [];
+  const prv  = Array.isArray(previous) ? previous : [];
+  console.log(`Timetable: ${cur.length} this week + ${prv.length} last week.`);
+  return cur.concat(prv);
 }
 
 async function loadFribbMapping() {
@@ -95,6 +119,32 @@ async function loadFribbMapping() {
   }
   console.log(`Loaded Fribb mapping: ${fribbByKitsu.size} kitsu-keyed entries.`);
   return fribbByKitsu;
+}
+
+// ---- English-dub filter ----------------------------------------------------
+// The dub timetable has no language field, so drop anything that names a
+// non-English dub in its titles or URL slug, e.g. "(Hindi Dub)",
+// "Spanish dub", "[Latin American]", "naruto-hindi-dub".
+const NON_ENGLISH_LANGS = [
+  'hindi', 'tamil', 'telugu', 'malayalam', 'kannada', 'bengali', 'marathi',
+  'spanish', 'castilian', 'latin american', 'latino', 'latam', 'portuguese', 'brazilian',
+  'french', 'german', 'italian', 'arabic', 'russian', 'ukrainian', 'polish', 'turkish',
+  'indonesian', 'malay', 'thai', 'vietnamese', 'tagalog', 'filipino', 'korean',
+  'mandarin', 'cantonese', 'chinese dub', 'japanese dub', 'dutch', 'swedish', 'norwegian',
+  'danish', 'finnish', 'greek', 'hebrew', 'czech', 'hungarian', 'romanian'
+];
+const LANG_ALT = NON_ENGLISH_LANGS.map((l) => l.replace(/ /g, '[\\s-]')).join('|');
+const NON_ENG_RE = new RegExp(
+  `(?:\\b(?:${LANG_ALT})[\\s-]*(?:dub|dubbed|audio|version)\\b)|` +   // "Hindi Dub"
+  `(?:[\\(\\[]\\s*(?:${LANG_ALT})\\s*[\\)\\]])`,                     // "(Hindi)"
+  'i'
+);
+
+function isEnglishDub(entry) {
+  if (entry.airType && String(entry.airType).toLowerCase() !== 'dub') return false;
+  const hay = [entry.title, entry.english, entry.romaji, entry.route, entry.delayedText]
+    .filter(Boolean).join(' | ');
+  return !NON_ENG_RE.test(hay);
 }
 
 function pickTitle(entry) {
@@ -368,14 +418,119 @@ async function fetchImage(url) {
   }
 }
 
-// Draws the label as a tab at the top centre, matching btttr.cc's own tag
-// (light grey tab flush with the top edge, rounded bottom corners, bold dark
-// text). Sizes are taken from btttr's 500x750 poster and scaled.
+// ---- Poster-tinted tag colour (like BetterPosters' own tags) ---------------
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, d = max - min;
+  let h = 0, s = 0;
+  if (d) {
+    s = d / (1 - Math.abs(2 * l - 1));
+    h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    h *= 60; if (h < 0) h += 360;
+  }
+  return [h, s, l];
+}
+
+function hslToHex(h, s, l) {
+  const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = l - c / 2;
+  const [r, g, b] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x]
+                  : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+  return '#' + [r, g, b].map((v) => Math.round((v + m) * 255).toString(16).padStart(2, '0')).join('');
+}
+
+function relLum(hex) {
+  const v = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)));
+  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+}
+function contrast(a, b) {
+  const [x, y] = [relLum(a), relLum(b)].sort((m, n) => n - m);
+  return (x + 0.05) / (y + 0.05);
+}
+
+// Look at the whole poster: overall brightness, dominant hue (weighted by
+// how colourful each pixel is) and how much of the poster is that hue in a
+// strong, mid-tone form.
+async function analyzePoster(buf) {
+  const { data, info } = await sharp(buf).resize(40, 60, { fit: 'fill' }).removeAlpha().raw()
+    .toBuffer({ resolveWithObject: true });
+  const N = data.length / info.channels, BUCKETS = 24;
+  const w = new Array(BUCKETS).fill(0), hx = new Array(BUCKETS).fill(0),
+        hy = new Array(BUCKETS).fill(0), ss = new Array(BUCKETS).fill(0),
+        vivid = new Array(BUCKETS).fill(0);
+  let sumL = 0;
+  for (let i = 0; i < data.length; i += info.channels) {
+    const [h, s, l] = rgbToHsl(data[i], data[i + 1], data[i + 2]);
+    sumL += l;
+    if (l < 0.06 || l > 0.95) continue;
+    const chroma = s * (1 - Math.abs(2 * l - 1));
+    if (chroma < 0.06) continue;
+    const b = Math.floor(h / (360 / BUCKETS)) % BUCKETS;
+    w[b] += chroma; ss[b] += s * chroma;
+    hx[b] += Math.cos(h * Math.PI / 180) * chroma; hy[b] += Math.sin(h * Math.PI / 180) * chroma;
+    if (s > 0.45 && l > 0.3 && l < 0.72) vivid[b]++;
+  }
+  let best = -1, bestW = 0;
+  for (let b = 0; b < BUCKETS; b++) {
+    const tot = w[b] + 0.5 * (w[(b + 1) % BUCKETS] + w[(b + BUCKETS - 1) % BUCKETS]);
+    if (tot > bestW) { bestW = tot; best = b; }
+  }
+  if (best < 0) return { meanL: sumL / N, hue: 210, sat: 0.05, vividShare: 0 };
+  let hue = Math.atan2(hy[best], hx[best]) * 180 / Math.PI; if (hue < 0) hue += 360;
+  const near = [best, (best + 1) % BUCKETS, (best + BUCKETS - 1) % BUCKETS];
+  return {
+    meanL: sumL / N,
+    hue,
+    sat: ss[best] / w[best],
+    vividShare: near.reduce((a, b) => a + vivid[b], 0) / N
+  };
+}
+
+// BetterPosters-style adaptive tag, picked per poster:
+//   strong single colour  → vivid tag, white text        (One Piece, Azur Lane)
+//   bright poster         → pale tint, dark text         (Horimiya, Banana Fish)
+//   dark but colourful    → mid-tone tint, white text    (Mushoku)
+//   dark and muted        → deep tint, white text        (Bleach, Apothecary)
+// Text colour is whichever of dark/white contrasts more with the tag.
+function adaptiveTagStyle(a) {
+  const { hue: h, sat: s, meanL, vividShare } = a;
+  let fill;
+  if (vividShare > 0.16)       fill = hslToHex(h, Math.min(0.78, Math.max(0.5, s)), 0.5);
+  else if (meanL >= 0.42)      fill = hslToHex(h, Math.min(0.4, Math.max(0.1, s * 0.6)), 0.86);
+  else if (s > 0.3)            fill = hslToHex(h, Math.min(0.45, s * 0.8), 0.31);
+  else                         fill = hslToHex(h, Math.min(0.25, s), 0.19);
+
+  const DARK = '#161616', LIGHT = '#FFFFFF';
+  let ink = contrast(fill, LIGHT) >= contrast(fill, DARK) ? LIGHT : DARK;
+  if (ink === LIGHT && contrast(fill, LIGHT) < 4.5) {
+    const [fh, fs] = rgbToHsl(...[1, 3, 5].map((i) => parseInt(fill.slice(i, i + 2), 16)));
+    for (let ll = 0.48; ll >= 0.25; ll -= 0.02) {
+      fill = hslToHex(fh, fs, ll);
+      if (contrast(fill, LIGHT) >= 4.5) break;
+    }
+  }
+  return { fill, ink };
+}
+
+async function renderTabText(text, ink, alpha, fontPx) {
+  const out = await sharp({
+    text: {
+      text: `<span foreground="${ink}" fgalpha="${alpha}">${escapeXml(text)}</span>`,
+      font: `Liberation Sans, Arimo, Arial, DejaVu Sans Bold ${fontPx}`,
+      rgba: true,
+      dpi: 72
+    }
+  }).png().toBuffer({ resolveWithObject: true });
+  return { img: out.data, w: out.info.width, h: out.info.height };
+}
+
+// Draws the label as a tab at the top centre in btttr.cc's tag shape (flush
+// with the top edge, rounded bottom corners). Sizes come from btttr's
+// 500x750 poster and are scaled to the actual image.
 async function renderLabeledPoster(srcUrl, outFile, label, state) {
   const buf = await fetchImage(srcUrl);
   if (!buf) return false;
-  const base = sharp(buf);
-  const { width, height } = await base.metadata();
+  const { width, height } = await sharp(buf).metadata();
   if (!width || !height) return false;
 
   const text  = `${label} ${state === 'soon' ? 'Soon' : state === 'delayed' ? 'Delayed' : 'Dubbed'}`;
@@ -383,36 +538,39 @@ async function renderLabeledPoster(srcUrl, outFile, label, state) {
   const tabH  = Math.round(70 * k);
   const padX  = Math.round(36 * k);
   const r     = Math.round(10 * k);
-  const fill  = state === 'dubbed' ? '#E7E7E7' : '#BDBDBD';
 
-  // Render the text with Pango so we know its exact width; shrink if too wide.
-  let fontPx = Math.round(42 * k);
-  let textImg, tw, th;
+  // Measure text, shrinking if it would be too wide.
+  let fontPx = Math.round(42 * k), t;
   for (;;) {
-    const out = await sharp({
-      text: {
-        text: `<span foreground="#191919">${escapeXml(text)}</span>`,
-        font: `Liberation Sans, Arimo, Arial, DejaVu Sans Bold ${fontPx}`,
-        rgba: true,
-        dpi: 72
-      }
-    }).png().toBuffer({ resolveWithObject: true });
-    textImg = out.data; tw = out.info.width; th = out.info.height;
-    if (tw + padX * 2 <= width * 0.86 || fontPx <= 20 * k) break;
+    t = await renderTabText(text, '#000000', '100%', fontPx);
+    if (t.w + padX * 2 <= width * 0.86 || fontPx <= 20 * k) break;
     fontPx -= 2;
   }
-
-  const tabW = tw + padX * 2;
+  const tabW = t.w + padX * 2;
   const x    = Math.round((width - tabW) / 2);
-  // Tab with square top corners and rounded bottom corners.
-  const tabSvg = `<svg width="${tabW}" height="${tabH}" xmlns="http://www.w3.org/2000/svg">
-    <path d="M0 0 H${tabW} V${tabH - r} Q${tabW} ${tabH} ${tabW - r} ${tabH} H${r} Q0 ${tabH} 0 ${tabH - r} Z" fill="${fill}"/>
-  </svg>`;
 
-  await base
+  const { fill, ink } = adaptiveTagStyle(await analyzePoster(buf));
+
+  // Frosted tab: blurred poster patch with the tint laid over it, clipped to the tab shape.
+  const shape = `M0 0 H${tabW} V${tabH - r} Q${tabW} ${tabH} ${tabW - r} ${tabH} H${r} Q0 ${tabH} 0 ${tabH - r} Z`;
+  const tint  = Buffer.from(`<svg width="${tabW}" height="${tabH}" xmlns="http://www.w3.org/2000/svg">
+    <path d="${shape}" fill="${fill}" fill-opacity="0.86"/></svg>`);
+  const mask  = Buffer.from(`<svg width="${tabW}" height="${tabH}" xmlns="http://www.w3.org/2000/svg">
+    <path d="${shape}" fill="#fff"/></svg>`);
+  const tab = await sharp(buf)
+    .extract({ left: x, top: 0, width: tabW, height: tabH })
+    .blur(Math.max(1, 8 * k))
+    .composite([{ input: tint }, { input: mask, blend: 'dest-in' }])
+    .png()
+    .toBuffer();
+
+  // Soon / delayed get slightly softer text so new dubs stand out.
+  const label_ = await renderTabText(text, ink, state === 'dubbed' ? '100%' : '72%', fontPx);
+
+  await sharp(buf)
     .composite([
-      { input: Buffer.from(tabSvg), top: 0, left: x },
-      { input: textImg, top: Math.max(0, Math.round((tabH - th) / 2)), left: Math.round((width - tw) / 2) }
+      { input: tab, top: 0, left: x },
+      { input: label_.img, top: Math.max(0, Math.round((tabH - label_.h) / 2)), left: Math.round((width - label_.w) / 2) }
     ])
     .jpeg({ quality: 88, mozjpeg: true })
     .toFile(outFile);
@@ -451,8 +609,15 @@ async function labelPosters(metas) {
 async function buildMetas() {
   const [timetable] = await Promise.all([fetchDubTimetable(), loadFribbMapping()]);
 
-  const list = Array.isArray(timetable) ? timetable : [];
-  console.log(`AnimeSchedule returned ${list.length} raw entries.`);
+  const raw  = Array.isArray(timetable) ? timetable : [];
+  console.log(`AnimeSchedule returned ${raw.length} raw entries.`);
+  const list = raw.filter(isEnglishDub);
+  const dropped = raw.filter((e) => !isEnglishDub(e));
+  console.log(`English-dub filter: kept ${list.length}, dropped ${dropped.length}` +
+    (dropped.length ? ` → ${dropped.map((e) => pickTitle(e) || e.route).join('; ')}` : '.'));
+  if (raw[0] && raw[0].streams) {
+    console.log('Sample streams (check for non-English sources):', JSON.stringify(raw[0].streams));
+  }
 
   // --- DEBUG: dump the raw Kobayashi entry, if present -----------------
   const kobayashi = list.find(
