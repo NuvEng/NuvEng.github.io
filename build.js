@@ -19,6 +19,7 @@ const path = require('path');
 // ---------------------------------------------------------------------------
 const AS_TOKEN = process.env.ANIMESCHEDULE_TOKEN;  // GitHub Actions secret
 const RPDB_KEY = process.env.RPDB_KEY || '';       // optional secret
+const USE_RPDB = process.env.USE_RPDB === 'true';  // opt-in
 const TMDB_KEY = process.env.TMDB_API_KEY || '';   // optional secret (v3 key or v4 read token)
 const MDBLIST_KEY = process.env.MDBLIST_API_KEY || ''; // optional secret
 
@@ -39,7 +40,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.4.0',
+  version: '0.4.1',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -125,10 +126,12 @@ function posterFor(finalId, kitsuPosterImage, imdbId, tmdbPoster) {
   const id = typeof finalId === 'string' ? finalId : String(finalId || '');
   const tt = id.startsWith('tt') ? id : imdbId;
 
-  if (RPDB_KEY && tt) {
+  // TMDB posters first: fast CDN, always load. RPDB only fills gaps, and only
+  // when USE_RPDB=true is set (RPDB images fail silently if the key expires).
+  if (tmdbPoster) return tmdbPoster;
+  if (RPDB_KEY && USE_RPDB && tt) {
     return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${tt}.jpg?fallback=true`;
   }
-  if (tmdbPoster) return tmdbPoster;
   if (kitsuPosterImage) {
     for (const size of ['medium', 'large', 'original', 'small']) {
       const u = kitsuPosterImage[size];
