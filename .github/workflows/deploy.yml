@@ -39,3 +39,19 @@ jobs:
           path: ./public
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  # GitHub auto-disables scheduled workflows after 60 days with no commits.
+  # Re-enabling the workflow via the API on every scheduled run resets that
+  # timer, so the cron keeps firing forever without needing dummy commits.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep scheduled workflow enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method PUT \
+            "repos/${{ github.repository }}/actions/workflows/deploy.yml/enable"
