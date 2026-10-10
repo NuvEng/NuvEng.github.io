@@ -20,10 +20,23 @@ const path = require('path');
 const AS_TOKEN = process.env.ANIMESCHEDULE_TOKEN;  // GitHub Actions secret
 const RPDB_KEY = process.env.RPDB_KEY || '';       // optional secret
 const USE_RPDB = process.env.USE_RPDB === 'true';  // opt-in
-const POSTER_TEMPLATE = 'https://btttr.cc/poster/imdb/poster-default/{imdb_id}.jpg';
+const POSTER_TEMPLATE = 'https://btttr.cc/poster/imdb/poster-default/{imdb_id}.jpg?tag=none';
 // Optional poster URL pattern (e.g. BetterPosters / btttr.cc "poster-only" URL).
 // Placeholders: {imdb_id} {tmdb_id} {type} (movie|series) {tmdb_type} (movie|tv)
 const POSTER_PATTERN = process.env.POSTER_URL_PATTERN || '';
+
+// Labeled posters ("S1 · E12 DUBBED") are rendered in CI and served from Pages.
+// Set LABEL_POSTERS=false in the workflow env to turn this off.
+const LABEL_POSTERS = process.env.LABEL_POSTERS !== 'false';
+const PAGES_BASE_URL = (process.env.PAGES_BASE_URL ||
+  (process.env.GITHUB_REPOSITORY
+    ? (() => {
+        const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+        return repo.toLowerCase() === `${owner.toLowerCase()}.github.io`
+          ? `https://${owner.toLowerCase()}.github.io`
+          : `https://${owner.toLowerCase()}.github.io/${repo}`;
+      })()
+    : '')).replace(/\/+$/, '');
 const TMDB_KEY = process.env.TMDB_API_KEY || '';   // optional secret (v3 key or v4 read token)
 const MDBLIST_KEY = process.env.MDBLIST_API_KEY || ''; // optional secret
 
@@ -44,7 +57,7 @@ const OUT_DIR    = path.join(__dirname, 'public');
 // ---------------------------------------------------------------------------
 const manifest = {
   id: 'community.animeschedule.dub',
-  version: '0.5.0',
+  version: '0.6.2',
   name: 'AnimeSchedule Dubbed',
   description:
     'A "Recently Dubbed" anime row sourced from AnimeSchedule.net, mapped to ' +
@@ -94,6 +107,45 @@ function pickDate(entry) {
   return Number.isNaN(t) ? 0 : t;
 }
 
+// AnimeSchedule Timetable Anime: episodeNumber, plus subtractedEpisodeNumber
+// when several episodes drop at once ("11-12").
+function pickEpisode(entry) {
+  const to   = Number(entry.episodeNumber);
+  if (!Number.isFinite(to) || to <= 0) return null;
+  const from = Number(entry.subtractedEpisodeNumber);
+  return Number.isFinite(from) && from > 0 && from < to ? `${from}-${to}` : String(to);
+}
+
+// 'dubbed' | 'soon' | 'delayed' from airingStatus (aired/airing/unaired/delayed-air),
+// falling back to the episode date.
+function pickState(entry, now) {
+  const a = String(entry.airingStatus || '').toLowerCase();
+  if (a === 'delayed-air' || String(entry.status || '').toLowerCase() === 'delayed') return 'delayed';
+  if (a === 'aired' || a === 'airing') return 'dubbed';
+  if (a === 'unaired') return 'soon';
+  return pickDate(entry) > now ? 'soon' : 'dubbed';
+}
+
+const ORDINAL_WORDS = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10 };
+
+// Season from the title ("2nd Season", "Season 3", "Third Season"), else Fribb.
+function pickSeason(title, fribbEntry) {
+  const t = String(title || '');
+  let m = t.match(/(\d+)\s*(?:st|nd|rd|th)\s+season/i) || t.match(/\bseason\s*(\d+)/i);
+  if (m) return Number(m[1]);
+  m = t.match(/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+season/i);
+  if (m) return ORDINAL_WORDS[m[1].toLowerCase()];
+  const fs_ = fribbEntry && fribbEntry.season;
+  if (fs_ && Number(fs_.tmdb) > 0) return Number(fs_.tmdb);
+  if (fs_ && Number(fs_.tvdb) > 0) return Number(fs_.tvdb);
+  return null;
+}
+
+function episodeLabel(season, episode) {
+  if (!episode) return null;
+  return season ? `S${season} · E${episode}` : `Ep ${episode}`;
+}
+
 async function resolveKitsuId(title) {
   if (!title) return null;
   if (kitsuCache.has(title)) return kitsuCache.get(title);
@@ -120,9 +172,9 @@ function mapKitsuToId(kitsuId) {
   const e = fribbByKitsu.get(Number(kitsuId));
   if (!e) return null;
   const tmdb = e.themoviedb_id || {};
-  if (tmdb.tv != null && tmdb.tv !== '')       return { id: `tmdb:${tmdb.tv}`, tmdbType: 'tv' };
-  if (typeof e.imdb_id === 'string' && e.imdb_id.startsWith('tt')) return { id: e.imdb_id, tmdbType: null };
-  if (tmdb.movie != null && tmdb.movie !== '') return { id: `tmdb:${tmdb.movie}`, tmdbType: 'movie' };
+  if (tmdb.tv != null && tmdb.tv !== '')       return { id: `tmdb:${tmdb.tv}`, tmdbType: 'tv', fribb: e };
+  if (typeof e.imdb_id === 'string' && e.imdb_id.startsWith('tt')) return { id: e.imdb_id, tmdbType: null, fribb: e };
+  if (tmdb.movie != null && tmdb.movie !== '') return { id: `tmdb:${tmdb.movie}`, tmdbType: 'movie', fribb: e };
   return null;
 }
 
@@ -288,6 +340,114 @@ function mdblistToFields(m) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// LABELED POSTERS — download each poster, draw an "S1 · E12 DUBBED" pill on it,
+// save it under public/posters/, and point the catalog at that copy.
+// Any failure falls back to the original poster URL.
+// ---------------------------------------------------------------------------
+let sharp = null;
+try { sharp = require('sharp'); } catch (e) { /* not installed → no labels */ }
+
+function escapeXml(s) {
+  return String(s).replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]));
+}
+
+async function fetchImage(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) return null;
+    const type = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+    if (type && !type.startsWith('image/')) return null;
+    return Buffer.from(await res.arrayBuffer());
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Draws the label as a tab at the top centre, matching btttr.cc's own tag
+// (light grey tab flush with the top edge, rounded bottom corners, bold dark
+// text). Sizes are taken from btttr's 500x750 poster and scaled.
+async function renderLabeledPoster(srcUrl, outFile, label, state) {
+  const buf = await fetchImage(srcUrl);
+  if (!buf) return false;
+  const base = sharp(buf);
+  const { width, height } = await base.metadata();
+  if (!width || !height) return false;
+
+  const text  = `${label} ${state === 'soon' ? 'Soon' : state === 'delayed' ? 'Delayed' : 'Dubbed'}`;
+  const k     = width / 500;
+  const tabH  = Math.round(70 * k);
+  const padX  = Math.round(36 * k);
+  const r     = Math.round(10 * k);
+  const fill  = state === 'dubbed' ? '#E7E7E7' : '#BDBDBD';
+
+  // Render the text with Pango so we know its exact width; shrink if too wide.
+  let fontPx = Math.round(42 * k);
+  let textImg, tw, th;
+  for (;;) {
+    const out = await sharp({
+      text: {
+        text: `<span foreground="#191919">${escapeXml(text)}</span>`,
+        font: `Liberation Sans, Arimo, Arial, DejaVu Sans Bold ${fontPx}`,
+        rgba: true,
+        dpi: 72
+      }
+    }).png().toBuffer({ resolveWithObject: true });
+    textImg = out.data; tw = out.info.width; th = out.info.height;
+    if (tw + padX * 2 <= width * 0.86 || fontPx <= 20 * k) break;
+    fontPx -= 2;
+  }
+
+  const tabW = tw + padX * 2;
+  const x    = Math.round((width - tabW) / 2);
+  // Tab with square top corners and rounded bottom corners.
+  const tabSvg = `<svg width="${tabW}" height="${tabH}" xmlns="http://www.w3.org/2000/svg">
+    <path d="M0 0 H${tabW} V${tabH - r} Q${tabW} ${tabH} ${tabW - r} ${tabH} H${r} Q0 ${tabH} 0 ${tabH - r} Z" fill="${fill}"/>
+  </svg>`;
+
+  await base
+    .composite([
+      { input: Buffer.from(tabSvg), top: 0, left: x },
+      { input: textImg, top: Math.max(0, Math.round((tabH - th) / 2)), left: Math.round((width - tw) / 2) }
+    ])
+    .jpeg({ quality: 88, mozjpeg: true })
+    .toFile(outFile);
+  return true;
+}
+
+async function labelPosters(metas) {
+  if (!LABEL_POSTERS) { console.log('LABEL_POSTERS=false — skipping poster labels.'); return; }
+  if (!sharp) { console.log('sharp not installed — skipping poster labels.'); return; }
+  if (!PAGES_BASE_URL) { console.log('PAGES_BASE_URL unknown — skipping poster labels.'); return; }
+
+  const dir = path.join(OUT_DIR, 'posters');
+  await fs.mkdir(dir, { recursive: true });
+
+  const jobs = metas.filter((m) => m.poster && m._label);
+  let done = 0, failed = 0, i = 0;
+  async function worker() {
+    while (i < jobs.length) {
+      const m = jobs[i++];
+      // Episode is in the filename so clients re-download when a new ep is dubbed.
+      const slug = `${m.id.replace(/[^a-z0-9]+/gi, '-')}-` +
+                   `${m._label.replace(/[^a-z0-9]+/gi, '').toLowerCase()}` +
+                   `${m._state === 'dubbed' ? '' : '-' + m._state}.jpg`;
+      try {
+        const ok = await renderLabeledPoster(m.poster, path.join(dir, slug), m._label, m._state);
+        if (ok) { m.poster = `${PAGES_BASE_URL}/posters/${slug}`; done++; } else failed++;
+      } catch (e) {
+        failed++;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: 6 }, worker));
+  console.log(`Labeled posters: ${done} rendered, ${failed} kept the original poster.`);
+}
+
 async function buildMetas() {
   const [timetable] = await Promise.all([fetchDubTimetable(), loadFribbMapping()]);
 
@@ -330,6 +490,7 @@ async function buildMetas() {
   let skipped = 0;
   let enriched = 0;
   let rated = 0;
+  let labeled = 0;
   console.log(POSTER_PATTERN ? 'Using custom POSTER_URL_PATTERN for posters.' : 'No POSTER_URL_PATTERN — using TMDB posters.');
   if (!MDBLIST_KEY) console.log('MDBLIST_API_KEY not set — skipping MDBList ratings.');
   if (!TMDB_KEY) console.log('TMDB_API_KEY not set — skipping TMDB enrichment.');
@@ -354,7 +515,15 @@ async function buildMetas() {
     const md = mdblistToFields(await fetchMdblist(imdbId, tmdbId, mapped.tmdbType));
     if (md.ratingsLine) rated++;
 
-    const description = [md.ratingsLine, t.description].filter(Boolean).join('\n\n') || undefined;
+    const label    = episodeLabel(pickSeason(title, mapped.fribb), pickEpisode(entry));
+    const state    = pickState(entry, now);
+    const dubLine  = !label ? null
+      : state === 'soon'    ? `🗓️ Next dub: ${label}`
+      : state === 'delayed' ? `⏸️ Dub delayed: ${label}${entry.delayedText ? ` (${entry.delayedText})` : ''}`
+      : `🆕 Dubbed: ${label}`;
+    if (label) labeled++;
+
+    const description = [dubLine, md.ratingsLine, t.description].filter(Boolean).join('\n\n') || undefined;
 
     metas.push({
       id:          finalId,
@@ -366,11 +535,13 @@ async function buildMetas() {
       description: description,
       releaseInfo: t.releaseInfo,
       genres:      t.genres,
-      imdbRating:  md.imdbRating || t.imdbRating
+      imdbRating:  md.imdbRating || t.imdbRating,
+      _label:      label,
+      _state:      state
     });
   }
 
-  console.log(`Built ${metas.length} items; skipped ${skipped} (no Kitsu hit or no Fribb mapping); TMDB-enriched ${enriched}; MDBList-rated ${rated}.`);
+  console.log(`Built ${metas.length} items; skipped ${skipped} (no Kitsu hit or no Fribb mapping); TMDB-enriched ${enriched}; MDBList-rated ${rated}; with episode number ${labeled}.`);
   console.log('Top 5 final order:', metas.slice(0, 5).map((m) => m.name));
   return metas;
 }
@@ -382,6 +553,8 @@ async function main() {
   if (!AS_TOKEN) throw new Error('ANIMESCHEDULE_TOKEN is not set.');
 
   const metas      = await buildMetas();
+  await labelPosters(metas);
+  for (const m of metas) { delete m._label; delete m._state; }
   const catalogDir = path.join(OUT_DIR, 'catalog', ITEM_TYPE);
 
   await fs.mkdir(catalogDir, { recursive: true });
